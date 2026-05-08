@@ -41,8 +41,8 @@ def get_supabase() -> Client:
     # 1. Versuche die Werte direkt aus den Streamlit Secrets zu laden
     # Das funktioniert in der Cloud (via Settings) und lokal (via .streamlit/secrets.toml)
     try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
+        url = os.environ["SUPABASE_URL]
+        key = os.environ["SUPABASE_KEY"]
     except KeyError:
         # 2. Fallback für lokale Entwicklung mit .env Datei
         url = os.environ.get("SUPABASE_URL")
