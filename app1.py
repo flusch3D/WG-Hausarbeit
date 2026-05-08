@@ -40,6 +40,7 @@ load_dotenv()
 def get_supabase() -> Client:
     # 1. Versuche die Werte direkt aus den Streamlit Secrets zu laden
     # Das funktioniert in der Cloud (via Settings) und lokal (via .streamlit/secrets.toml)
+    print("-"*30)
     try:
         url = os.environ["SUPABASE_URL"]
         key = os.environ["SUPABASE_KEY"]
