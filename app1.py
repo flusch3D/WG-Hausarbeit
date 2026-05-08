@@ -44,7 +44,7 @@ def get_supabase() -> Client:
     try:
         url = os.environ["SUPABASE_URL"]
         key = os.environ["SUPABASE_KEY"]
-        print(url, "\n", key)
+        print(url + "\n" + "key:" +key)
         print("-"*30)
     except KeyError:
         # 2. Fallback für lokale Entwicklung mit .env Datei
