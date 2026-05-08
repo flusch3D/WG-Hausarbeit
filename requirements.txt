@@ -1,7 +1,7 @@
 httpx==0.24.1
 httpcore==0.17.3
 pandas
-streamlit==1.32.0
+streamlit>=1.32.0
 supabase==2.4.0
 python-dotenv==1.0.1
 plotly==5.18.0
