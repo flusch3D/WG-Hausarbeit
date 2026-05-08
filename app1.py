@@ -43,6 +43,8 @@ def get_supabase() -> Client:
     try:
         url = os.environ["SUPABASE_URL"]
         key = os.environ["SUPABASE_KEY"]
+
+        print("-"*30)
     except KeyError:
         # 2. Fallback für lokale Entwicklung mit .env Datei
         url = os.environ.get("SUPABASE_URL")
