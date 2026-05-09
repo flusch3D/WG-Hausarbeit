@@ -42,8 +42,8 @@ def get_supabase() -> Client:
     # Das funktioniert in der Cloud (via Settings) und lokal (via .streamlit/secrets.toml)
     print("-"*30)
     try:
-        url = os.environ["SUPABASE_URL"]
-        key = os.environ["SUPABASE_KEY"]
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
         print(url + "\n" + "key:" +key)
         print("-"*30)
     except KeyError:
