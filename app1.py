@@ -43,6 +43,9 @@ RECURRENCES = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}
 RECURRENCE_DAYS = {"daily": 1, "weekly": 7, "monthly": 30}
 RECURRENCE_PERIODS = {"daily": 30, "weekly": 8, "monthly": 3}
 
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+# preferred_day: weekly → 0–6 (weekday Mon=0), monthly → 1–31 (day of month), daily → None
+
 ROLES = {
     "moderator": {"label": "👑 Moderator", "color": "#f59e0b"},
     "editor":    {"label": "✏️ Editor",    "color": "#60a5fa"},
@@ -276,19 +279,23 @@ def set_wg_locked(wg_id: str, locked: bool):
 def get_tasks(wg_id: str) -> list[dict]:
     return get_supabase().table("tasks").select("*").eq("wg_id", wg_id).eq("active", True).order("category").execute().data or []
 
-def create_task(wg_id: str, title: str, description: str, category: str, recurrence: str, effort: int) -> str:
+def create_task(wg_id: str, title: str, description: str, category: str,
+                recurrence: str, effort: int, preferred_day: Optional[int] = None) -> str:
     tid = new_id()
     get_supabase().table("tasks").insert({
         "id": tid, "wg_id": wg_id, "title": title, "description": description,
-        "category": category, "recurrence": recurrence, "effort_minutes": effort, "active": True
+        "category": category, "recurrence": recurrence, "effort_minutes": effort,
+        "active": True, "preferred_day": preferred_day,
     }).execute()
     get_tasks.clear()
     return tid
 
-def update_task(task_id: str, title: str, description: str, category: str, recurrence: str, effort: int):
+def update_task(task_id: str, title: str, description: str, category: str,
+                recurrence: str, effort: int, preferred_day: Optional[int] = None):
     get_supabase().table("tasks").update({
         "title": title, "description": description,
-        "category": category, "recurrence": recurrence, "effort_minutes": effort
+        "category": category, "recurrence": recurrence,
+        "effort_minutes": effort, "preferred_day": preferred_day,
     }).eq("id", task_id).execute()
     get_tasks.clear()
 
@@ -303,6 +310,7 @@ def run_rotation(wg_id: str) -> int:
     """
     Assigns tasks fairly across members.
     Generates 30 periods for daily, 8 for weekly, 3 for monthly tasks.
+    Honors preferred_day: weekly → specific weekday, monthly → specific day of month.
     No one gets the same task twice in a row. Balances workload over time.
     """
     sb = get_supabase()
@@ -317,8 +325,10 @@ def run_rotation(wg_id: str) -> int:
     today      = date.today()
 
     for task in tasks:
-        days_ahead = RECURRENCE_DAYS.get(task["recurrence"], 7)
-        n_periods  = RECURRENCE_PERIODS.get(task["recurrence"], 4)
+        recurrence    = task["recurrence"]
+        days_ahead    = RECURRENCE_DAYS.get(recurrence, 7)
+        n_periods     = RECURRENCE_PERIODS.get(recurrence, 4)
+        preferred_day = task.get("preferred_day")  # weekday 0-6 or day-of-month 1-31
 
         last_res = sb.table("assignments") \
             .select("assigned_to, due_date").eq("task_id", task["id"]) \
@@ -327,17 +337,49 @@ def run_rotation(wg_id: str) -> int:
 
         if last_data:
             last_person = last_data["assigned_to"]
-            start_date  = date.fromisoformat(last_data["due_date"]) + timedelta(days=days_ahead)
+            last_date   = date.fromisoformat(last_data["due_date"])
+            # Next anchor is one period after the last due date
+            anchor = last_date + timedelta(days=days_ahead)
         else:
             last_person = None
-            start_date  = today
+            anchor      = today
+
+        # Snap anchor to preferred day if set
+        if preferred_day is not None:
+            if recurrence == "weekly":
+                # Shift anchor forward to the desired weekday (0=Mon)
+                diff = (preferred_day - anchor.weekday()) % 7
+                anchor = anchor + timedelta(days=diff)
+            elif recurrence == "monthly":
+                # Clamp to valid day in the anchor's month
+                import calendar
+                day = min(preferred_day, calendar.monthrange(anchor.year, anchor.month)[1])
+                anchor = anchor.replace(day=day)
+                # If that day is already in the past relative to where we started, advance one month
+                if anchor < today and not last_data:
+                    if anchor.month == 12:
+                        anchor = anchor.replace(year=anchor.year + 1, month=1)
+                    else:
+                        max_day = calendar.monthrange(anchor.year, anchor.month + 1)[1]
+                        anchor = anchor.replace(month=anchor.month + 1, day=min(preferred_day, max_day))
 
         local_workload = dict(workload)
 
         for i in range(n_periods):
-            due = start_date + timedelta(days=days_ahead * i)
+            if recurrence == "monthly" and preferred_day is not None:
+                import calendar
+                # Each period advances by one month, keeping the preferred day
+                m_offset = anchor.month - 1 + i
+                year  = anchor.year + m_offset // 12
+                month = m_offset % 12 + 1
+                day   = min(preferred_day, calendar.monthrange(year, month)[1])
+                due   = date(year, month, day)
+            else:
+                due = anchor + timedelta(days=days_ahead * i)
+
             if due < today:
                 continue
+
             exists = sb.table("assignments").select("id") \
                 .eq("task_id", task["id"]).eq("due_date", due.isoformat()).execute()
             if exists.data:
@@ -678,7 +720,13 @@ def render_tasks(wg: dict, user: dict, my_role: str):
                     with col1:
                         st.markdown(f"**{e(t['title'])}**  \n<small style='color:#888'>{e(t['description'] or 'No description')}</small>", unsafe_allow_html=True)
                     with col2:
-                        st.caption(f"🔄 {t['recurrence']} · ⏱ {t['effort_minutes']} min")
+                        freq_label = t["recurrence"]
+                        pday = t.get("preferred_day")
+                        if t["recurrence"] == "weekly" and pday is not None:
+                            freq_label += f" · {WEEKDAYS[pday]}"
+                        elif t["recurrence"] == "monthly" and pday is not None:
+                            freq_label += f" · day {pday}"
+                        st.caption(f"🔄 {freq_label} · ⏱ {t['effort_minutes']} min")
                     with col3:
                         if can(my_role, "edit_task") and st.button("✏️", key=f"edit_{t['id']}", help="Edit"):
                             st.session_state[f"editing_{t['id']}"] = True; st.rerun()
@@ -699,11 +747,23 @@ def render_tasks(wg: dict, user: dict, my_role: str):
                                 e_rec = RECURRENCES[e_rec_label]
                             with ec3:
                                 e_effort = st.slider("Effort (min)", 5, 120, t["effort_minutes"], 5, key=f"e_eff_{t['id']}")
+
+                            e_preferred_day = None
+                            cur_pday = t.get("preferred_day")
+                            if e_rec == "weekly":
+                                cur_wd = WEEKDAYS[cur_pday] if (cur_pday is not None and e_rec == t["recurrence"]) else WEEKDAYS[0]
+                                wd_sel = st.selectbox("📅 Day of week", WEEKDAYS,
+                                    index=WEEKDAYS.index(cur_wd), key=f"e_wd_{t['id']}")
+                                e_preferred_day = WEEKDAYS.index(wd_sel)
+                            elif e_rec == "monthly":
+                                cur_md = cur_pday if (cur_pday is not None and e_rec == t["recurrence"]) else 1
+                                e_preferred_day = st.number_input("📅 Day of month (1–31)",
+                                    min_value=1, max_value=31, value=int(cur_md), key=f"e_md_{t['id']}")
                             bc1, bc2 = st.columns(2)
                             with bc1:
                                 if st.button("💾 Save", key=f"save_{t['id']}", use_container_width=True):
                                     if e_title.strip():
-                                        update_task(t["id"], e_title.strip(), e_desc.strip(), e_cat, e_rec, e_effort)
+                                        update_task(t["id"], e_title.strip(), e_desc.strip(), e_cat, e_rec, e_effort, e_preferred_day)
                                         del st.session_state[f"editing_{t['id']}"]
                                         st.success("✅ Saved!"); st.rerun()
                                     else:
@@ -724,11 +784,19 @@ def render_tasks(wg: dict, user: dict, my_role: str):
                 rec_label = st.selectbox("Recurrence", list(RECURRENCES.keys()), key="task_rec")
                 rec = RECURRENCES[rec_label]
             with col3: effort = st.slider("Effort (min)", 5, 120, 30, 5, key="task_effort")
+
+            preferred_day = None
+            if rec == "weekly":
+                wd = st.selectbox("📅 Which day of the week?", WEEKDAYS, key="task_pref_weekday")
+                preferred_day = WEEKDAYS.index(wd)
+            elif rec == "monthly":
+                preferred_day = st.number_input("📅 Which day of the month? (1–31)", min_value=1, max_value=31, value=1, key="task_pref_monthday")
+
             if st.button("✅ Create task", use_container_width=True, key="btn_create_task"):
                 if not title.strip():
                     st.error("Title is required.")
                 else:
-                    create_task(wg["id"], title.strip(), desc.strip(), cat, rec, effort)
+                    create_task(wg["id"], title.strip(), desc.strip(), cat, rec, effort, preferred_day)
                     run_rotation(wg["id"]); get_assignments.clear()
                     st.success(f"✅ Task '{title}' created and rotation updated!"); st.rerun()
 
