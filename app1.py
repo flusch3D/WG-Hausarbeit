@@ -308,8 +308,9 @@ def delete_task(task_id: str):
 
 def run_rotation(wg_id: str) -> int:
     """
-    Assigns tasks fairly across members by gathering all needed slots first,
-    sorting them by date, and then distributing them to balance daily and total workload.
+    Verteilt Aufgaben fair über alle Mitglieder.
+    Sammelt zuerst alle Slots, sortiert sie chronologisch und verteilt dann,
+    um eine Durchmischung innerhalb der Woche zu garantieren.
     """
     sb = get_supabase()
     members, tasks = get_wg_members(wg_id), get_tasks(wg_id)
@@ -317,25 +318,29 @@ def run_rotation(wg_id: str) -> int:
         return 0
 
     member_ids = [m["id"] for m in members]
-    n_members = len(member_ids)
+    n_members  = len(member_ids)
     
-    # 1. Alle "offenen Slots" über alle Tasks hinweg sammeln
-    all_slots = []
+    # 1. Aktuellen Workload aus der DB holen (nur einmal!)
+    global_workload = get_workload_counts(wg_id)
     today = date.today()
-
+    
+    # 2. Alle fälligen Termine (Slots) für alle Tasks sammeln
+    all_slots = []
     for task in tasks:
         recurrence = task["recurrence"]
         days_ahead = RECURRENCE_DAYS.get(recurrence, 7)
-        n_periods = RECURRENCE_PERIODS.get(recurrence, 4)
+        n_periods  = RECURRENCE_PERIODS.get(recurrence, 4)
         preferred_day = task.get("preferred_day")
 
-        # Letzten Termin für diesen spezifischen Task finden
+        # Letzten Termin für diesen Task finden
         last_res = sb.table("assignments") \
-            .select("due_date") \
-            .eq("task_id", task["id"]) \
+            .select("due_date").eq("task_id", task["id"]) \
             .order("due_date", desc=True).limit(1).execute()
         
-        anchor = date.fromisoformat(last_res.data[0]["due_date"]) + timedelta(days=days_ahead) if last_res.data else today
+        if last_res.data:
+            anchor = date.fromisoformat(last_res.data[0]["due_date"]) + timedelta(days=days_ahead)
+        else:
+            anchor = today
 
         # Anker an preferred_day anpassen
         if preferred_day is not None:
@@ -347,11 +352,13 @@ def run_rotation(wg_id: str) -> int:
                 day = min(preferred_day, calendar.monthrange(anchor.year, anchor.month)[1])
                 anchor = anchor.replace(day=day)
                 if anchor < today and not last_res.data:
-                    if anchor.month == 12: anchor = anchor.replace(year=anchor.year + 1, month=1)
+                    if anchor.month == 12:
+                        anchor = anchor.replace(year=anchor.year + 1, month=1)
                     else:
                         max_day = calendar.monthrange(anchor.year, anchor.month + 1)[1]
                         anchor = anchor.replace(month=anchor.month + 1, day=min(preferred_day, max_day))
 
+        # Zukünftige Termine für diesen Task generieren
         for i in range(n_periods):
             if recurrence == "monthly" and preferred_day is not None:
                 import calendar
@@ -372,31 +379,29 @@ def run_rotation(wg_id: str) -> int:
     if not all_slots:
         return 0
 
-    # 2. Alle Slots chronologisch sortieren (Wichtig für die tägliche Durchmischung!)
+    # 3. WICHTIG: Alle Slots über alle Tasks hinweg chronologisch sortieren
     all_slots.sort(key=lambda x: x["due"])
 
-    # 3. Workload-Tracking initialisieren
-    global_workload = get_workload_counts(wg_id) # Gesamtanzahl erledigter/zugewiesener Tasks
-    # Wir tracken auch, wer an welchem Tag schon was macht
-    daily_assignments = {} 
-    # Und wer welchen Task zuletzt gemacht hat (um Wiederholungen zu vermeiden)
-    last_person_for_task = {}
-
+    # 4. Slots nacheinander verteilen
     created = 0
+    # Tracker für "Wer hat diesen speziellen Task zuletzt gemacht"
+    last_person_for_task = {} 
+    # Tracker für "Wer macht heute schon was"
+    daily_load = {} 
+
     for slot in all_slots:
         t_id = slot["task"]["id"]
         due_str = slot["due"].isoformat()
         
-        # Wer hat insgesamt am wenigsten zu tun UND heute noch nichts?
-        # Wir sortieren die Mitglieder nach:
-        # 1. Anzahl der Tasks am selben Tag (Primär: damit keiner 3 Dinge an einem Tag macht)
-        # 2. Gesamt-Workload (Sekundär: für die langfristige Fairness)
+        # Mitglieder sortieren nach:
+        # 1. Haben sie an DIESEM Tag schon eine Aufgabe? (Primär für Durchmischung)
+        # 2. Wie viel haben sie INSGESAMT schon getan? (Fairness)
         sorted_members = sorted(member_ids, key=lambda uid: (
-            daily_assignments.get((uid, due_str), 0),
+            daily_load.get((uid, due_str), 0),
             global_workload.get(uid, 0)
         ))
 
-        # Versuchen, nicht dieselbe Person wie beim letzten Mal für diesen Task zu nehmen
+        # Den nächsten nehmen, aber nicht die gleiche Person wie beim letzten Mal für diesen Task
         next_person = next(
             (m for m in sorted_members if n_members == 1 or m != last_person_for_task.get(t_id)),
             sorted_members[0]
@@ -409,9 +414,9 @@ def run_rotation(wg_id: str) -> int:
             "status": "open", "comment": ""
         }).execute()
 
-        # Tracker aktualisieren
+        # Statistiken für diesen Durchlauf aktualisieren
         global_workload[next_person] = global_workload.get(next_person, 0) + 1
-        daily_assignments[(next_person, due_str)] = daily_assignments.get((next_person, due_str), 0) + 1
+        daily_load[(next_person, due_str)] = daily_load.get((next_person, due_str), 0) + 1
         last_person_for_task[t_id] = next_person
         created += 1
 
