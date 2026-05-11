@@ -308,112 +308,208 @@ def delete_task(task_id: str):
 
 def run_rotation(wg_id: str) -> int:
     """
-    Verteilt Aufgaben so, dass pro Woche eine maximale Gleichverteilung herrscht.
-    Jeder Member bekommt erst eine zweite Aufgabe in einer Woche, wenn alle anderen 
-    bereits eine haben. Zudem rotieren die Aufgabentypen.
+    Verteilt Aufgaben fair über alle Mitglieder.
+    Ziel:
+    - Jede Person soll möglichst nur 1 Aufgabe pro Woche bekommen
+    - Erst wenn alle eine Aufgabe haben, wird eine zweite verteilt
+    - Niemand bekommt denselben Task zweimal hintereinander
+    - Tageslast und Gesamtlast bleiben fair verteilt
     """
+
     sb = get_supabase()
-    members, tasks = get_wg_members(wg_id), get_tasks(wg_id)
+    members = get_wg_members(wg_id)
+    tasks = get_tasks(wg_id)
+
     if not members or not tasks:
         return 0
 
     member_ids = [m["id"] for m in members]
     n_members = len(member_ids)
-    
-    # 1. Alle fälligen Termine (Slots) sammeln
-    all_slots = []
+
+    # Bereits erledigte Aufgaben als Fairness-Basis
+    global_workload = get_workload_counts(wg_id)
+
     today = date.today()
 
+    # Alle zukünftigen Slots sammeln
+    all_slots = []
+
     for task in tasks:
+
         recurrence = task["recurrence"]
         days_ahead = RECURRENCE_DAYS.get(recurrence, 7)
         n_periods = RECURRENCE_PERIODS.get(recurrence, 4)
         preferred_day = task.get("preferred_day")
 
-        # Letzten Termin suchen, um den Ankerpunkt zu finden
-        last_res = sb.table("assignments") \
-            .select("due_date") \
-            .eq("task_id", task["id"]) \
-            .order("due_date", desc=True).limit(1).execute()
-        
-        anchor = date.fromisoformat(last_res.data[0]["due_date"]) + timedelta(days=days_ahead) if last_res.data else today
+        # Letzten Termin holen
+        last_res = (
+            sb.table("assignments")
+            .select("due_date")
+            .eq("task_id", task["id"])
+            .order("due_date", desc=True)
+            .limit(1)
+            .execute()
+        )
 
-        # Wochentag/Monatstag anpassen
+        if last_res.data:
+            anchor = (
+                date.fromisoformat(last_res.data[0]["due_date"])
+                + timedelta(days=days_ahead)
+            )
+        else:
+            anchor = today
+
+        # Preferred day berücksichtigen
         if preferred_day is not None:
+
             if recurrence == "weekly":
                 diff = (preferred_day - anchor.weekday()) % 7
                 anchor = anchor + timedelta(days=diff)
+
             elif recurrence == "monthly":
                 import calendar
-                day = min(preferred_day, calendar.monthrange(anchor.year, anchor.month)[1])
-                anchor = anchor.replace(day=day)
-                if anchor < today and not last_res.data:
-                    if anchor.month == 12: anchor = anchor.replace(year=anchor.year + 1, month=1)
-                    else: anchor = anchor.replace(month=anchor.month + 1, day=min(preferred_day, calendar.monthrange(anchor.year, anchor.month+1)[1]))
 
+                day = min(
+                    preferred_day,
+                    calendar.monthrange(anchor.year, anchor.month)[1]
+                )
+
+                anchor = anchor.replace(day=day)
+
+                if anchor < today and not last_res.data:
+
+                    if anchor.month == 12:
+                        anchor = anchor.replace(
+                            year=anchor.year + 1,
+                            month=1
+                        )
+                    else:
+                        max_day = calendar.monthrange(
+                            anchor.year,
+                            anchor.month + 1
+                        )[1]
+
+                        anchor = anchor.replace(
+                            month=anchor.month + 1,
+                            day=min(preferred_day, max_day)
+                        )
+
+        # Zukünftige Termine erzeugen
         for i in range(n_periods):
+
             if recurrence == "monthly" and preferred_day is not None:
+
                 import calendar
+
                 m_offset = anchor.month - 1 + i
-                year, month = anchor.year + m_offset // 12, m_offset % 12 + 1
-                due = date(year, month, min(preferred_day, calendar.monthrange(year, month)[1]))
+                year = anchor.year + m_offset // 12
+                month = m_offset % 12 + 1
+
+                due = date(
+                    year,
+                    month,
+                    min(
+                        preferred_day,
+                        calendar.monthrange(year, month)[1]
+                    )
+                )
+
             else:
                 due = anchor + timedelta(days=days_ahead * i)
 
-            if due < today: continue
+            if due < today:
+                continue
 
-            # Prüfen ob Slot existiert
-            exists = sb.table("assignments").select("id").eq("task_id", task["id"]).eq("due_date", due.isoformat()).execute()
+            # Prüfen ob Assignment bereits existiert
+            exists = (
+                sb.table("assignments")
+                .select("id")
+                .eq("task_id", task["id"])
+                .eq("due_date", due.isoformat())
+                .execute()
+            )
+
             if not exists.data:
-                all_slots.append({"task": task, "due": due})
+                all_slots.append({
+                    "task": task,
+                    "due": due
+                })
 
     if not all_slots:
         return 0
 
-    # 2. Sortieren nach Datum (wichtig!)
+    # Chronologisch sortieren
     all_slots.sort(key=lambda x: x["due"])
 
-    # 3. Workload-Tracking
-    global_workload = get_workload_counts(wg_id) # Gesamtanzahl erledigter Tasks
-    weekly_tracker = {}     # Key: (member_id, week_start_date), Value: Anzahl Tasks
-    last_person_for_task = {} # Damit man nicht 2x hintereinander den gleichen Task macht
-
     created = 0
-    for slot in all_slots:
-        t_id = slot["task"]["id"]
-        due_date = slot["due"]
-        # Wochenstart berechnen (Montag dieser Woche)
-        w_start = (due_date - timedelta(days=due_date.weekday())).isoformat()
-        
-        # Mitglieder sortieren nach:
-        # 1. Wie viele Tasks hat die Person IN DIESER WOCHE schon? (Wichtigste Prio)
-        # 2. Wie viel hat die Person INSGESAMT im Leben der WG getan? (Fairness)
-        sorted_members = sorted(member_ids, key=lambda uid: (
-            weekly_tracker.get((uid, w_start), 0),
-            global_workload.get(uid, 0)
-        ))
 
-        # Person wählen (darf nicht dieselbe wie beim letzten Mal für diesen spezifischen Task sein)
+    # Tracker
+    last_person_for_task = {}
+    daily_load = {}
+    weekly_load = {}
+
+    for slot in all_slots:
+
+        task = slot["task"]
+        task_id = task["id"]
+
+        due = slot["due"]
+        due_str = due.isoformat()
+
+        week_key = due.isocalendar()[1]
+
+        # Mitglieder sortieren:
+        # 1. Wenigste Wochenaufgaben
+        # 2. Wenigste Tagesaufgaben
+        # 3. Wenigste Gesamtaufgaben
+        sorted_members = sorted(
+            member_ids,
+            key=lambda uid: (
+                weekly_load.get((uid, week_key), 0),
+                daily_load.get((uid, due_str), 0),
+                global_workload.get(uid, 0)
+            )
+        )
+
+        # Nicht dieselbe Person wie letztes Mal
         next_person = next(
-            (m for m in sorted_members if n_members == 1 or m != last_person_for_task.get(t_id)),
+            (
+                m for m in sorted_members
+                if n_members == 1
+                or m != last_person_for_task.get(task_id)
+            ),
             sorted_members[0]
         )
 
-        # In DB speichern
+        # Assignment speichern
         sb.table("assignments").insert({
-            "id": new_id(), "task_id": t_id, "wg_id": wg_id,
-            "assigned_to": next_person, "due_date": due_date.isoformat(),
-            "status": "open", "comment": ""
+            "id": new_id(),
+            "task_id": task_id,
+            "wg_id": wg_id,
+            "assigned_to": next_person,
+            "due_date": due_str,
+            "status": "open",
+            "comment": ""
         }).execute()
 
-        # Tracker für diesen Durchlauf aktualisieren
-        global_workload[next_person] = global_workload.get(next_person, 0) + 1
-        weekly_tracker[(next_person, w_start)] = weekly_tracker.get((next_person, w_start), 0) + 1
-        last_person_for_task[t_id] = next_person
+        # Tracker aktualisieren
+        global_workload[next_person] = (
+            global_workload.get(next_person, 0) + 1
+        )
+
+        daily_load[(next_person, due_str)] = (
+            daily_load.get((next_person, due_str), 0) + 1
+        )
+
+        weekly_load[(next_person, week_key)] = (
+            weekly_load.get((next_person, week_key), 0) + 1
+        )
+
+        last_person_for_task[task_id] = next_person
+
         created += 1
 
     return created
-
 @st.cache_data(ttl=60)
 def get_workload_counts(wg_id: str) -> dict:
     rows = get_supabase().table("assignments").select("assigned_to").eq("wg_id", wg_id).eq("status", "done").execute().data or []
