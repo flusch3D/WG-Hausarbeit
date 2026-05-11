@@ -507,7 +507,195 @@ def run_rotation(wg_id: str) -> int:
 
         last_person_for_task[task_id] = next_person
 
-        created += 1
+        created += 1def run_rotation(wg_id: str) -> int:
+    """
+    Faire Rotation:
+    - Jede Person bekommt maximal 1 Task pro Woche
+    - Erst wenn alle Mitglieder einen Task haben,
+      startet die Verteilung erneut
+    - Niemand bekommt denselben Task zweimal hintereinander
+    """
+
+    sb = get_supabase()
+
+    members = get_wg_members(wg_id)
+    tasks = get_tasks(wg_id)
+
+    if not members or not tasks:
+        return 0
+
+    member_ids = [m["id"] for m in members]
+    n_members = len(member_ids)
+
+    today = date.today()
+
+    global_workload = get_workload_counts(wg_id)
+
+    all_slots = []
+
+    # --------------------------------------------------
+    # Alle zukünftigen Slots sammeln
+    # --------------------------------------------------
+
+    for task in tasks:
+
+        recurrence = task["recurrence"]
+        days_ahead = RECURRENCE_DAYS.get(recurrence, 7)
+        n_periods = RECURRENCE_PERIODS.get(recurrence, 4)
+        preferred_day = task.get("preferred_day")
+
+        last_res = (
+            sb.table("assignments")
+            .select("due_date")
+            .eq("task_id", task["id"])
+            .order("due_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if last_res.data:
+            anchor = (
+                date.fromisoformat(last_res.data[0]["due_date"])
+                + timedelta(days=days_ahead)
+            )
+        else:
+            anchor = today
+
+        # Weekly preferred weekday
+        if preferred_day is not None and recurrence == "weekly":
+            diff = (preferred_day - anchor.weekday()) % 7
+            anchor = anchor + timedelta(days=diff)
+
+        for i in range(n_periods):
+
+            due = anchor + timedelta(days=days_ahead * i)
+
+            if due < today:
+                continue
+
+            exists = (
+                sb.table("assignments")
+                .select("id")
+                .eq("task_id", task["id"])
+                .eq("due_date", due.isoformat())
+                .execute()
+            )
+
+            if not exists.data:
+                all_slots.append({
+                    "task": task,
+                    "due": due
+                })
+
+    if not all_slots:
+        return 0
+
+    # --------------------------------------------------
+    # Nach Woche gruppieren
+    # --------------------------------------------------
+
+    weekly_slots = {}
+
+    for slot in all_slots:
+
+        week = (
+            slot["due"].isocalendar().year,
+            slot["due"].isocalendar().week
+        )
+
+        if week not in weekly_slots:
+            weekly_slots[week] = []
+
+        weekly_slots[week].append(slot)
+
+    created = 0
+
+    # Für "nicht zweimal hintereinander"
+    last_person_for_task = {}
+
+    # --------------------------------------------------
+    # Jede Woche separat fair verteilen
+    # --------------------------------------------------
+
+    for week_key, slots in weekly_slots.items():
+
+        # chronologisch sortieren
+        slots.sort(key=lambda x: x["due"])
+
+        # Reihenfolge der Mitglieder
+        # mit wenigster Gesamtarbeit zuerst
+        member_queue = sorted(
+            member_ids,
+            key=lambda uid: global_workload.get(uid, 0)
+        )
+
+        queue_index = 0
+
+        for slot in slots:
+
+            task = slot["task"]
+            task_id = task["id"]
+
+            due_str = slot["due"].isoformat()
+
+            assigned = False
+
+            # Jeder bekommt zuerst genau 1 Task
+            for _ in range(len(member_queue)):
+
+                uid = member_queue[queue_index % len(member_queue)]
+                queue_index += 1
+
+                # nicht denselben task zweimal hintereinander
+                if (
+                    n_members > 1
+                    and uid == last_person_for_task.get(task_id)
+                ):
+                    continue
+
+                # Assignment erstellen
+                sb.table("assignments").insert({
+                    "id": new_id(),
+                    "task_id": task_id,
+                    "wg_id": wg_id,
+                    "assigned_to": uid,
+                    "due_date": due_str,
+                    "status": "open",
+                    "comment": ""
+                }).execute()
+
+                global_workload[uid] = (
+                    global_workload.get(uid, 0) + 1
+                )
+
+                last_person_for_task[task_id] = uid
+
+                created += 1
+                assigned = True
+                break
+
+            # Fallback
+            if not assigned:
+
+                uid = member_queue[0]
+
+                sb.table("assignments").insert({
+                    "id": new_id(),
+                    "task_id": task_id,
+                    "wg_id": wg_id,
+                    "assigned_to": uid,
+                    "due_date": due_str,
+                    "status": "open",
+                    "comment": ""
+                }).execute()
+
+                global_workload[uid] = (
+                    global_workload.get(uid, 0) + 1
+                )
+
+                last_person_for_task[task_id] = uid
+
+                created += 1
 
     return created
 @st.cache_data(ttl=60)
