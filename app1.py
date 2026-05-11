@@ -308,9 +308,9 @@ def delete_task(task_id: str):
 
 def run_rotation(wg_id: str) -> int:
     """
-    Verteilt Aufgaben fair über alle Mitglieder.
-    Sammelt zuerst alle fälligen Termine aller Aufgaben, sortiert sie chronologisch
-    und verteilt sie dann, um eine Durchmischung innerhalb der Woche zu garantieren.
+    Verteilt Aufgaben so, dass pro Woche eine maximale Gleichverteilung herrscht.
+    Jeder Member bekommt erst eine zweite Aufgabe in einer Woche, wenn alle anderen 
+    bereits eine haben. Zudem rotieren die Aufgabentypen.
     """
     sb = get_supabase()
     members, tasks = get_wg_members(wg_id), get_tasks(wg_id)
@@ -320,7 +320,7 @@ def run_rotation(wg_id: str) -> int:
     member_ids = [m["id"] for m in members]
     n_members = len(member_ids)
     
-    # 1. Alle "offenen Slots" sammeln, anstatt sie sofort zu speichern
+    # 1. Alle fälligen Termine (Slots) sammeln
     all_slots = []
     today = date.today()
 
@@ -330,7 +330,7 @@ def run_rotation(wg_id: str) -> int:
         n_periods = RECURRENCE_PERIODS.get(recurrence, 4)
         preferred_day = task.get("preferred_day")
 
-        # Letzten Termin für diesen spezifischen Task finden
+        # Letzten Termin suchen, um den Ankerpunkt zu finden
         last_res = sb.table("assignments") \
             .select("due_date") \
             .eq("task_id", task["id"]) \
@@ -338,7 +338,7 @@ def run_rotation(wg_id: str) -> int:
         
         anchor = date.fromisoformat(last_res.data[0]["due_date"]) + timedelta(days=days_ahead) if last_res.data else today
 
-        # Anker an preferred_day anpassen
+        # Wochentag/Monatstag anpassen
         if preferred_day is not None:
             if recurrence == "weekly":
                 diff = (preferred_day - anchor.weekday()) % 7
@@ -349,23 +349,20 @@ def run_rotation(wg_id: str) -> int:
                 anchor = anchor.replace(day=day)
                 if anchor < today and not last_res.data:
                     if anchor.month == 12: anchor = anchor.replace(year=anchor.year + 1, month=1)
-                    else:
-                        max_day = calendar.monthrange(anchor.year, anchor.month + 1)[1]
-                        anchor = anchor.replace(month=anchor.month + 1, day=min(preferred_day, max_day))
+                    else: anchor = anchor.replace(month=anchor.month + 1, day=min(preferred_day, calendar.monthrange(anchor.year, anchor.month+1)[1]))
 
         for i in range(n_periods):
             if recurrence == "monthly" and preferred_day is not None:
                 import calendar
                 m_offset = anchor.month - 1 + i
-                year = anchor.year + m_offset // 12
-                month = m_offset % 12 + 1
+                year, month = anchor.year + m_offset // 12, m_offset % 12 + 1
                 due = date(year, month, min(preferred_day, calendar.monthrange(year, month)[1]))
             else:
                 due = anchor + timedelta(days=days_ahead * i)
 
             if due < today: continue
 
-            # Nur hinzufügen, wenn der Termin noch nicht in der DB steht
+            # Prüfen ob Slot existiert
             exists = sb.table("assignments").select("id").eq("task_id", task["id"]).eq("due_date", due.isoformat()).execute()
             if not exists.data:
                 all_slots.append({"task": task, "due": due})
@@ -373,47 +370,46 @@ def run_rotation(wg_id: str) -> int:
     if not all_slots:
         return 0
 
-    # 2. ALLE Slots chronologisch sortieren (das sorgt für die Durchmischung pro Woche!)
+    # 2. Sortieren nach Datum (wichtig!)
     all_slots.sort(key=lambda x: x["due"])
 
-    # 3. Workload-Tracking initialisieren
-    # global_workload: Wie viel hat jemand insgesamt (historisch) getan
-    global_workload = get_workload_counts(wg_id)
-    # daily_tracker: Wer macht an welchem Tag schon wie viel (um Klumpenbildung zu vermeiden)
-    daily_tracker = {}
-    # last_person_per_task: Damit niemand denselben Task zweimal hintereinander bekommt
-    last_person_per_task = {}
+    # 3. Workload-Tracking
+    global_workload = get_workload_counts(wg_id) # Gesamtanzahl erledigter Tasks
+    weekly_tracker = {}     # Key: (member_id, week_start_date), Value: Anzahl Tasks
+    last_person_for_task = {} # Damit man nicht 2x hintereinander den gleichen Task macht
 
     created = 0
     for slot in all_slots:
         t_id = slot["task"]["id"]
-        due_str = slot["due"].isoformat()
+        due_date = slot["due"]
+        # Wochenstart berechnen (Montag dieser Woche)
+        w_start = (due_date - timedelta(days=due_date.weekday())).isoformat()
         
         # Mitglieder sortieren nach:
-        # 1. Haben sie heute schon was zu tun? (Wichtig für Durchmischung am selben Tag)
-        # 2. Wie ist ihr Gesamt-Workload? (Wichtig für langfristige Fairness)
+        # 1. Wie viele Tasks hat die Person IN DIESER WOCHE schon? (Wichtigste Prio)
+        # 2. Wie viel hat die Person INSGESAMT im Leben der WG getan? (Fairness)
         sorted_members = sorted(member_ids, key=lambda uid: (
-            daily_tracker.get((uid, due_str), 0),
+            weekly_tracker.get((uid, w_start), 0),
             global_workload.get(uid, 0)
         ))
 
-        # Die beste Person wählen (darf nicht dieselbe wie beim letzten Mal für diesen Task sein)
+        # Person wählen (darf nicht dieselbe wie beim letzten Mal für diesen spezifischen Task sein)
         next_person = next(
-            (m for m in sorted_members if n_members == 1 or m != last_person_per_task.get(t_id)),
+            (m for m in sorted_members if n_members == 1 or m != last_person_for_task.get(t_id)),
             sorted_members[0]
         )
 
-        # Speichern
+        # In DB speichern
         sb.table("assignments").insert({
             "id": new_id(), "task_id": t_id, "wg_id": wg_id,
-            "assigned_to": next_person, "due_date": due_str,
+            "assigned_to": next_person, "due_date": due_date.isoformat(),
             "status": "open", "comment": ""
         }).execute()
 
-        # Tracker aktualisieren
+        # Tracker für diesen Durchlauf aktualisieren
         global_workload[next_person] = global_workload.get(next_person, 0) + 1
-        daily_tracker[(next_person, due_str)] = daily_tracker.get((next_person, due_str), 0) + 1
-        last_person_per_task[t_id] = next_person
+        weekly_tracker[(next_person, w_start)] = weekly_tracker.get((next_person, w_start), 0) + 1
+        last_person_for_task[t_id] = next_person
         created += 1
 
     return created
