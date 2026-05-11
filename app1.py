@@ -1,7 +1,6 @@
 import streamlit as st
 import hashlib
 import uuid
-import random
 import html as html_lib
 import smtplib
 import pandas as pd
@@ -309,133 +308,119 @@ def delete_task(task_id: str):
 
 def run_rotation(wg_id: str) -> int:
     """
-    Einfache RANDOM Rotation:
-    - Tasks werden zufällig verteilt
-    - Niemand bekommt denselben Task zweimal hintereinander
+    Verteilt Aufgaben fair über alle Mitglieder.
+    Sammelt zuerst alle Slots, sortiert sie chronologisch und verteilt dann,
+    um eine Durchmischung innerhalb der Woche zu garantieren.
     """
-
     sb = get_supabase()
-
-    members = get_wg_members(wg_id)
-    tasks = get_tasks(wg_id)
-
+    members, tasks = get_wg_members(wg_id), get_tasks(wg_id)
     if not members or not tasks:
         return 0
 
     member_ids = [m["id"] for m in members]
-
+    n_members  = len(member_ids)
+    
+    # 1. Aktuellen Workload aus der DB holen (nur einmal!)
+    global_workload = get_workload_counts(wg_id)
     today = date.today()
-
+    
+    # 2. Alle fälligen Termine (Slots) für alle Tasks sammeln
     all_slots = []
-
-    # --------------------------------------------------
-    # Alle zukünftigen Slots sammeln
-    # --------------------------------------------------
-
     for task in tasks:
-
         recurrence = task["recurrence"]
         days_ahead = RECURRENCE_DAYS.get(recurrence, 7)
-        n_periods = RECURRENCE_PERIODS.get(recurrence, 4)
+        n_periods  = RECURRENCE_PERIODS.get(recurrence, 4)
+        preferred_day = task.get("preferred_day")
 
-        last_res = (
-            sb.table("assignments")
-            .select("due_date")
-            .eq("task_id", task["id"])
-            .order("due_date", desc=True)
-            .limit(1)
-            .execute()
-        )
-
+        # Letzten Termin für diesen Task finden
+        last_res = sb.table("assignments") \
+            .select("due_date").eq("task_id", task["id"]) \
+            .order("due_date", desc=True).limit(1).execute()
+        
         if last_res.data:
-            anchor = (
-                date.fromisoformat(last_res.data[0]["due_date"])
-                + timedelta(days=days_ahead)
-            )
+            anchor = date.fromisoformat(last_res.data[0]["due_date"]) + timedelta(days=days_ahead)
         else:
             anchor = today
 
+        # Anker an preferred_day anpassen
+        if preferred_day is not None:
+            if recurrence == "weekly":
+                diff = (preferred_day - anchor.weekday()) % 7
+                anchor = anchor + timedelta(days=diff)
+            elif recurrence == "monthly":
+                import calendar
+                day = min(preferred_day, calendar.monthrange(anchor.year, anchor.month)[1])
+                anchor = anchor.replace(day=day)
+                if anchor < today and not last_res.data:
+                    if anchor.month == 12:
+                        anchor = anchor.replace(year=anchor.year + 1, month=1)
+                    else:
+                        max_day = calendar.monthrange(anchor.year, anchor.month + 1)[1]
+                        anchor = anchor.replace(month=anchor.month + 1, day=min(preferred_day, max_day))
+
+        # Zukünftige Termine für diesen Task generieren
         for i in range(n_periods):
+            if recurrence == "monthly" and preferred_day is not None:
+                import calendar
+                m_offset = anchor.month - 1 + i
+                year = anchor.year + m_offset // 12
+                month = m_offset % 12 + 1
+                due = date(year, month, min(preferred_day, calendar.monthrange(year, month)[1]))
+            else:
+                due = anchor + timedelta(days=days_ahead * i)
 
-            due = anchor + timedelta(days=days_ahead * i)
+            if due < today: continue
 
-            if due < today:
-                continue
-
-            exists = (
-                sb.table("assignments")
-                .select("id")
-                .eq("task_id", task["id"])
-                .eq("due_date", due.isoformat())
-                .execute()
-            )
-
+            # Prüfen, ob dieser Slot schon existiert
+            exists = sb.table("assignments").select("id").eq("task_id", task["id"]).eq("due_date", due.isoformat()).execute()
             if not exists.data:
-                all_slots.append({
-                    "task": task,
-                    "due": due
-                })
+                all_slots.append({"task": task, "due": due})
 
     if not all_slots:
         return 0
 
-    # Chronologisch sortieren
+    # 3. WICHTIG: Alle Slots über alle Tasks hinweg chronologisch sortieren
     all_slots.sort(key=lambda x: x["due"])
 
+    # 4. Slots nacheinander verteilen
     created = 0
-
-    # Speichert wer den Task zuletzt hatte
-    last_person_for_task = {}
-
-    # --------------------------------------------------
-    # RANDOM VERTEILUNG
-    # --------------------------------------------------
+    # Tracker für "Wer hat diesen speziellen Task zuletzt gemacht"
+    last_person_for_task = {} 
+    # Tracker für "Wer macht heute schon was"
+    daily_load = {} 
 
     for slot in all_slots:
-
-        task = slot["task"]
-        task_id = task["id"]
-
+        t_id = slot["task"]["id"]
         due_str = slot["due"].isoformat()
+        
+        # Mitglieder sortieren nach:
+        # 1. Haben sie an DIESEM Tag schon eine Aufgabe? (Primär für Durchmischung)
+        # 2. Wie viel haben sie INSGESAMT schon getan? (Fairness)
+        sorted_members = sorted(member_ids, key=lambda uid: (
+            daily_load.get((uid, due_str), 0),
+            global_workload.get(uid, 0)
+        ))
 
-        # zufällige Reihenfolge
-        shuffled_members = member_ids[:]
-        random.shuffle(shuffled_members)
+        # Den nächsten nehmen, aber nicht die gleiche Person wie beim letzten Mal für diesen Task
+        next_person = next(
+            (m for m in sorted_members if n_members == 1 or m != last_person_for_task.get(t_id)),
+            sorted_members[0]
+        )
 
-        # möglichst nicht dieselbe Person wie letztes Mal
-        chosen = None
-
-        for uid in shuffled_members:
-
-            if len(member_ids) == 1:
-                chosen = uid
-                break
-
-            if uid != last_person_for_task.get(task_id):
-                chosen = uid
-                break
-
-        # Fallback
-        if chosen is None:
-            chosen = random.choice(member_ids)
-
-        # Assignment speichern
+        # In DB speichern
         sb.table("assignments").insert({
-            "id": new_id(),
-            "task_id": task_id,
-            "wg_id": wg_id,
-            "assigned_to": chosen,
-            "due_date": due_str,
-            "status": "open",
-            "comment": ""
+            "id": new_id(), "task_id": t_id, "wg_id": wg_id,
+            "assigned_to": next_person, "due_date": due_str,
+            "status": "open", "comment": ""
         }).execute()
 
-        last_person_for_task[task_id] = chosen
-
+        # Statistiken für diesen Durchlauf aktualisieren
+        global_workload[next_person] = global_workload.get(next_person, 0) + 1
+        daily_load[(next_person, due_str)] = daily_load.get((next_person, due_str), 0) + 1
+        last_person_for_task[t_id] = next_person
         created += 1
 
     return created
-
 
 @st.cache_data(ttl=60)
 def get_workload_counts(wg_id: str) -> dict:
