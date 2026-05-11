@@ -1,6 +1,7 @@
 import streamlit as st
 import hashlib
 import uuid
+import random
 import html as html_lib
 import smtplib
 import pandas as pd
@@ -305,12 +306,11 @@ def delete_task(task_id: str):
 
 
 # ── Rotation engine ────────────────────────────────
+
 def run_rotation(wg_id: str) -> int:
     """
-    Faire Rotation:
-    - Jede Person bekommt maximal 1 Task pro Woche
-    - Erst wenn alle Mitglieder einen Task haben,
-      startet die Verteilung erneut
+    Einfache RANDOM Rotation:
+    - Tasks werden zufällig verteilt
     - Niemand bekommt denselben Task zweimal hintereinander
     """
 
@@ -323,11 +323,8 @@ def run_rotation(wg_id: str) -> int:
         return 0
 
     member_ids = [m["id"] for m in members]
-    n_members = len(member_ids)
 
     today = date.today()
-
-    global_workload = get_workload_counts(wg_id)
 
     all_slots = []
 
@@ -340,7 +337,6 @@ def run_rotation(wg_id: str) -> int:
         recurrence = task["recurrence"]
         days_ahead = RECURRENCE_DAYS.get(recurrence, 7)
         n_periods = RECURRENCE_PERIODS.get(recurrence, 4)
-        preferred_day = task.get("preferred_day")
 
         last_res = (
             sb.table("assignments")
@@ -358,11 +354,6 @@ def run_rotation(wg_id: str) -> int:
             )
         else:
             anchor = today
-
-        # Weekly preferred weekday
-        if preferred_day is not None and recurrence == "weekly":
-            diff = (preferred_day - anchor.weekday()) % 7
-            anchor = anchor + timedelta(days=diff)
 
         for i in range(n_periods):
 
@@ -388,112 +379,60 @@ def run_rotation(wg_id: str) -> int:
     if not all_slots:
         return 0
 
-    # --------------------------------------------------
-    # Nach Woche gruppieren
-    # --------------------------------------------------
-
-    weekly_slots = {}
-
-    for slot in all_slots:
-
-        week = (
-            slot["due"].isocalendar().year,
-            slot["due"].isocalendar().week
-        )
-
-        if week not in weekly_slots:
-            weekly_slots[week] = []
-
-        weekly_slots[week].append(slot)
+    # Chronologisch sortieren
+    all_slots.sort(key=lambda x: x["due"])
 
     created = 0
 
-    # Für "nicht zweimal hintereinander"
+    # Speichert wer den Task zuletzt hatte
     last_person_for_task = {}
 
     # --------------------------------------------------
-    # Jede Woche separat fair verteilen
+    # RANDOM VERTEILUNG
     # --------------------------------------------------
 
-    for week_key, slots in weekly_slots.items():
+    for slot in all_slots:
 
-        # chronologisch sortieren
-        slots.sort(key=lambda x: x["due"])
+        task = slot["task"]
+        task_id = task["id"]
 
-        # Reihenfolge der Mitglieder
-        # mit wenigster Gesamtarbeit zuerst
-        member_queue = sorted(
-            member_ids,
-            key=lambda uid: global_workload.get(uid, 0)
-        )
+        due_str = slot["due"].isoformat()
 
-        queue_index = 0
+        # zufällige Reihenfolge
+        shuffled_members = member_ids[:]
+        random.shuffle(shuffled_members)
 
-        for slot in slots:
+        # möglichst nicht dieselbe Person wie letztes Mal
+        chosen = None
 
-            task = slot["task"]
-            task_id = task["id"]
+        for uid in shuffled_members:
 
-            due_str = slot["due"].isoformat()
-
-            assigned = False
-
-            # Jeder bekommt zuerst genau 1 Task
-            for _ in range(len(member_queue)):
-
-                uid = member_queue[queue_index % len(member_queue)]
-                queue_index += 1
-
-                # nicht denselben task zweimal hintereinander
-                if (
-                    n_members > 1
-                    and uid == last_person_for_task.get(task_id)
-                ):
-                    continue
-
-                # Assignment erstellen
-                sb.table("assignments").insert({
-                    "id": new_id(),
-                    "task_id": task_id,
-                    "wg_id": wg_id,
-                    "assigned_to": uid,
-                    "due_date": due_str,
-                    "status": "open",
-                    "comment": ""
-                }).execute()
-
-                global_workload[uid] = (
-                    global_workload.get(uid, 0) + 1
-                )
-
-                last_person_for_task[task_id] = uid
-
-                created += 1
-                assigned = True
+            if len(member_ids) == 1:
+                chosen = uid
                 break
 
-            # Fallback
-            if not assigned:
+            if uid != last_person_for_task.get(task_id):
+                chosen = uid
+                break
 
-                uid = member_queue[0]
+        # Fallback
+        if chosen is None:
+            chosen = random.choice(member_ids)
 
-                sb.table("assignments").insert({
-                    "id": new_id(),
-                    "task_id": task_id,
-                    "wg_id": wg_id,
-                    "assigned_to": uid,
-                    "due_date": due_str,
-                    "status": "open",
-                    "comment": ""
-                }).execute()
+        # Assignment speichern
+        sb.table("assignments").insert({
+            "id": new_id(),
+            "task_id": task_id,
+            "wg_id": wg_id,
+            "assigned_to": chosen,
+            "due_date": due_str,
+            "status": "open",
+            "comment": ""
+        }).execute()
 
-                global_workload[uid] = (
-                    global_workload.get(uid, 0) + 1
-                )
+        last_person_for_task[task_id] = chosen
 
-                last_person_for_task[task_id] = uid
-
-                created += 1
+        created += 1
 
     return created
 
